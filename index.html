@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>UV拾取器</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden;font-family:system-ui}
+#main{display:flex;height:100%}
+#canvasWrap{flex:1;overflow:hidden;background:#222;position:relative}
+#cv{position:absolute;cursor:crosshair;image-rendering:pixelated;image-rendering:-moz-crisp-edges;image-rendering:crisp-edges}
+#panel{width:720px;padding:12px;background:#1a1a1a;color:#fff;display:flex;flex-direction:column;height:100vh}
+#out{white-space:pre-wrap;background:#000;color:#0f0;padding:10px;margin-top:8px;font-size:12px;flex:1;overflow:auto}
+#tip{font-size:12px;color:#ffd700;margin:4px 0}
+#coordTip{font-size:12px;color:#8cf;margin:4px 0}
+.btns{display:flex;gap:4px;flex-wrap:wrap;margin:6px 0}
+#historyList{background:#222;padding:6px;margin:6px 0;max-height:120px;overflow:auto;font-size:11px}
+#historyList div{padding:3px 4px;cursor:pointer;border-bottom:#333 solid 1px}
+#historyList div:hover{background:#383838}
+button{padding:6px 8px;cursor:pointer}
+.info{font-size:12px;color:#aaa;margin:6px 0}
+label{font-size:12px;color:#ccc;margin-right:8px}
+</style>
+</head>
+<body>
+<div id="main">
+  <div id="canvasWrap"><canvas id="cv"></canvas></div>
+  <div id="panel">
+    <input type="file" id="imgFile" accept="image/*">
+    <div class="info">
+左键单击放顶点 · 点首顶点闭合<br>
+Alt+拖拽顶点微调 · 空格+拖拽平移 · 滚轮缩放<br>
+右键单击选中选区 · Delete 删除<br>
+Ctrl+Z 撤销 · Ctrl+Shift+Z 重做<br>
+F 实心/空心 · G 生成 Java 代码 · C 复制 UV
+    </div>
+    <div id="tip"></div>
+    <div id="coordTip"></div>
+    <div class="btns">
+      <button onclick="undo()">撤销</button>
+      <button onclick="redo()">重做</button>
+      <button onclick="undoAll()">全部清空</button>
+      <button onclick="copyUV()">复制UV</button>
+      <button onclick="genCode()">生成Java</button>
+      <button onclick="copyCode()">复制Java</button>
+    </div>
+    <div>
+      <label><input type="radio" name="mode" value="solid" checked onchange="setMode('solid')">实心</label>
+      <label><input type="radio" name="mode" value="hollow" onchange="setMode('hollow')">空心</label>
+    </div>
+    <div>历史快照：</div>
+    <div id="historyList"></div>
+    <div id="out"></div>
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById('cv');
+const ctx = canvas.getContext('2d');
+const wrap = document.getElementById("canvasWrap");
+canvas.width = wrap.clientWidth;
+canvas.height = wrap.clientHeight;
+ctx.imageSmoothingEnabled = false;
+ctx.webkitImageSmoothingEnabled = false;
+ctx.msImageSmoothingEnabled = false;
+
+let img=null, imgW=0, imgH=0;
+let scale=4, viewX=0, viewY=0;
+let dragView=false, dragViewStart={x:0,y:0};
+let mouseTex={x:0,y:0};
+let spaceDown=false, altDown=false;
+let mode='solid';
+
+let historyStack=[], redoStack=[];
+let currentPath=[];
+let shapes=[];
+let selectedShape=-1;
+let dragPointIdx=null;
+const pointSize=4, hitRange=12, dragThreshold=4;
+let mouseDownStart={x:0,y:0};
+
+function saveHistory(){
+  historyStack.push({
+    shapes: JSON.parse(JSON.stringify(shapes)),
+    currentPath: JSON.parse(JSON.stringify(currentPath))
+  });
+  if(historyStack.length>50) historyStack.shift();
+  redoStack=[];
+  renderHistoryList();
+}
+function undo(){
+  if(historyStack.length===0) return;
+  redoStack.push({
+    shapes: JSON.parse(JSON.stringify(shapes)),
+    currentPath: JSON.parse(JSON.stringify(currentPath))
+  });
+  const last=historyStack.pop();
+  shapes=JSON.parse(JSON.stringify(last.shapes));
+  currentPath=JSON.parse(JSON.stringify(last.currentPath));
+  renderHistoryList(); redraw();
+}
+function redo(){
+  if(redoStack.length===0) return;
+  historyStack.push({
+    shapes: JSON.parse(JSON.stringify(shapes)),
+    currentPath: JSON.parse(JSON.stringify(currentPath))
+  });
+  const last=redoStack.pop();
+  shapes=JSON.parse(JSON.stringify(last.shapes));
+  currentPath=JSON.parse(JSON.stringify(last.currentPath));
+  renderHistoryList(); redraw();
+}
+function undoAll(){
+  saveHistory();
+  shapes=[]; currentPath=[]; selectedShape=-1;
+  redraw();
+}
+function jumpToHistory(idx){
+  const snap=historyStack[idx];
+  shapes=JSON.parse(JSON.stringify(snap.shapes));
+  currentPath=JSON.parse(JSON.stringify(snap.currentPath));
+  historyStack=historyStack.slice(0, idx+1);
+  renderHistoryList(); redraw();
+}
+function renderHistoryList(){
+  const el=document.getElementById("historyList");
+  el.innerHTML="";
+  historyStack.forEach((snap,i)=>{
+    const div=document.createElement("div");
+    div.textContent=`快照${i+1}: 选区${snap.shapes.length}，顶点${snap.currentPath.length}`;
+    div.onclick=()=>jumpToHistory(i);
+    el.appendChild(div);
+  });
+}
+
+function screen2tex(sx,sy){
+  return {x: Math.round((sx-viewX)/scale), y: Math.round((sy-viewY)/scale)};
+}
+function tex2screen(tx,ty){
+  return {x: tx*scale+viewX, y: ty*scale+viewY};
+}
+function drawRectPoint(sx,sy,color="#fff"){
+  ctx.fillStyle=color;
+  ctx.fillRect(sx-pointSize, sy-pointSize, pointSize*2, pointSize*2);
+}
+
+function redraw(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  if(!img) return;
+  ctx.save();
+  ctx.translate(viewX,viewY);
+  ctx.scale(scale,scale);
+  ctx.drawImage(img,0,0);
+  ctx.restore();
+
+  shapes.forEach((shp, idx)=>{
+    const isSel = idx===selectedShape;
+    ctx.strokeStyle = isSel ? "#ff0" : "#0ff";
+    ctx.lineWidth = isSel ? 3 : 2;
+    ctx.beginPath();
+    const pts = shp.points.map(p=>tex2screen(p.x,p.y));
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for(let i=1;i<pts.length;i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.fillStyle = isSel ? "rgba(255,255,0,0.15)" : "rgba(0,255,255,0.10)";
+    ctx.fill();
+    for(const p of pts) drawRectPoint(p.x,p.y, isSel ? "#ffff00" : "#ffffff");
+  });
+
+  if(currentPath.length>0){
+    ctx.strokeStyle="#ff0"; ctx.lineWidth=2;
+    ctx.beginPath();
+    const pts = currentPath.map(p=>tex2screen(p.x,p.y));
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for(let i=1;i<pts.length;i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.stroke();
+    const lastPt = pts[pts.length-1];
+    const mPos = tex2screen(mouseTex.x, mouseTex.y);
+    ctx.beginPath();
+    ctx.moveTo(lastPt.x, lastPt.y);
+    ctx.lineTo(mPos.x, mPos.y);
+    ctx.strokeStyle="#ff6600";
+    ctx.stroke();
+    for(const p of pts) drawRectPoint(p.x,p.y,"#ffff00");
+  }
+
+  updateOutput(); updateTip();
+}
+
+function calcBounds(points){
+  let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+  for(const p of points){
+    minX=Math.min(minX,p.x); minY=Math.min(minY,p.y);
+    maxX=Math.max(maxX,p.x); maxY=Math.max(maxY,p.y);
+  }
+  return {u:minX, v:minY, w:maxX-minX, h:maxY-minY, u2:maxX, v2:maxY};
+}
+
+function updateTip(){
+  const tipEl=document.getElementById("tip");
+  const coordEl=document.getElementById("coordTip");
+  if(currentPath.length===0){
+    tipEl.textContent="点击图片放置第一个顶点";
+    coordEl.textContent="";
+  }else{
+    tipEl.textContent=`顶点数：${currentPath.length}，单击首顶点闭合`;
+    const last=currentPath[currentPath.length-1];
+    coordEl.textContent=`最后顶点：X=${last.x}, Y=${last.y}`;
+  }
+}
+
+function updateOutput(){
+  let txt="UV详细信息 -- by github sf ovo https://github.com/sf326/mc_gui_uv_extract\nat pages https://sf326.github.io/mc_gui_uv_extract/\n贴图尺寸："+imgW+" × "+imgH+"\n\n";
+  shapes.forEach((shp, idx)=>{
+    const b=shp.bounds;
+    txt+=`【选区 ${idx+1}】\n`;
+    txt+="顶点："+shp.points.map(p=>`(${p.x},${p.y})`).join(" , ")+"\n";
+    txt+=`包围盒：u=${b.u}, v=${b.v}, w=${b.w}, h=${b.h}\n`;
+    txt+=`对角：左上(${b.u},${b.v})，右下(${b.u2},${b.v2})\n`;
+    txt+=`归一UV：[${(b.u/imgW).toFixed(4)},${(b.v/imgH).toFixed(4)},${(b.u2/imgW).toFixed(4)},${(b.v2/imgH).toFixed(4)}]\n`;
+    txt+="--------------------------------------------------------\n";
+  });
+  document.getElementById('out').innerText=txt;
+}
+
+/**
+ * 扫描线填充（逐列），不做内缩。
+ * 返回 cols[col] = [[y1,y2], ...]
+ *
+ * 规则：
+ *  - 水平边：col 在 [minX, maxX] 内，贡献该 y
+ *  - 竖边：只在 col === x1 时贡献 [minY, maxY]
+ *  - 斜边：col 在 [minX, maxX) 内贡献交点 y
+ */
+function scanColumns(shape){
+    const b = shape.bounds;
+    const w = b.w;
+    const pts = shape.points.map(p => ({x: p.x - b.u, y: p.y - b.v}));
+    const n = pts.length;
+    const cols = [];
+
+    //射线法
+    function pointInPoly(px, py){
+        let inside = false;
+        for(let i=0, j=n-1; i<n; j=i++){
+            const xi = pts[i].x, yi = pts[i].y;
+            const xj = pts[j].x, yj = pts[j].y;
+            const intersect = ((yi > py) !== (yj > py))
+                && (px < (xj - xi) * (py - yi) / (yj - yi) + xi);
+            if(intersect) inside = !inside;
+        }
+        return inside;
+    }
+
+    for (let col = 0; col < w; col++) {
+        const segs = [];
+        let startY = null;
+        //像素中心测试
+        const minLocalY = 0;
+        const maxLocalY = b.h;
+        for(let y=minLocalY; y <= maxLocalY; y++){
+            //col+0.5 , y+0.5
+            const centerX = col + 0.5;
+            const centerY = y + 0.5;
+            const inPoly = pointInPoly(centerX, centerY);
+            if(inPoly && startY === null){
+                startY = y;
+            }else if(!inPoly && startY !== null){
+                segs.push([startY, y]);
+                startY = null;
+            }
+        }
+        if(startY !== null){
+            segs.push([startY, maxLocalY]);
+        }
+        cols.push(segs);
+    }
+    return cols;
+}
+
+function genCode(){
+  if(shapes.length===0){ alert("没有选区"); return; }
+  let minU = Infinity, minV = Infinity, maxU = -Infinity, maxV = -Infinity;
+  shapes.forEach(s => {
+    const b = s.bounds;
+    minU = Math.min(minU, b.u);
+    minV = Math.min(minV, b.v);
+    maxU = Math.max(maxU, b.u2);
+    maxV = Math.max(maxV, b.v2);
+  });
+  const totalW = maxU - minU;
+  const allCols = shapes.map(s => scanColumns(s));
+  let code="";
+  code+="//by github sf ovo https://github.com/sf326/mc_gui_uv_extract\n";
+  code+="//at pages https://sf326.github.io/mc_gui_uv_extract\n";
+  code+="@Override\n";
+  code+="protected void renderBg(GuiGraphics guiGraphics, float v, int i, int i1) {\n";
+  code+="    int guiX = (this.width - this.imageWidth) / 2 - 27;\n";
+  code+="    int guiY = (this.height - this.imageHeight) / 2;\n\n";
+  code+="    guiGraphics.blit(TextureBackGround, guiX, guiY, 0, 0, 256, 256);\n\n";
+  code+=`    int barX = guiX + ${minU};\n`;
+  code+=`    int barY = guiY + ${minV};\n`;
+  code+=`    int barW = ${totalW};\n\n`;
+  code+="    BlockPos pos = this.menu.getTablePos();\n";
+  code+="    int progress = ArmorCastingTableBlockEntityCache.get(pos);\n";
+  code+="    float ratio = progress / 100.0F;\n";
+  code+="    float cutoff = barW * ratio;\n\n";
+  code+="    int emptyColor = 0xFFCFA88A;\n";
+  code+="    int fullColor  = 0xFFFFFFFF;\n\n";
+  shapes.forEach((shp, si) => {
+    const b = shp.bounds;
+    const shapeGlobalOffsetX = b.u - minU;//全局X偏移
+    const localY = b.v - minV;
+    const cols = allCols[si];
+    code+=`    // 选区 ${si+1}\n`;
+    code+=`    for (int col = 0; col < ${b.w}; col++) {\n`;
+    code+=`        int worldX = barX + ${shapeGlobalOffsetX} + col;\n`;
+    code+=`        float globalColX = ${shapeGlobalOffsetX} + col;\n`;
+    code+=`        int color = (globalColX < cutoff) ? fullColor : emptyColor;\n\n`;
+    cols.forEach((segs, col) => {
+      if (segs.length === 0) return;
+      code+=`        if (col == ${col}) {\n`;
+      segs.forEach(([y1, y2]) => {
+        code+=`            guiGraphics.fill(worldX, barY + ${localY + y1}, worldX + 1, barY + ${localY + y2}, color);\n`;
+      });
+      code+="        }\n";
+    });
+    code+="    }\n\n";
+  });
+  code+="}\n";
+  document.getElementById('out').innerText=code;
+  window.__javaCode=code;
+}
+
+
+function copyUV(){
+  navigator.clipboard.writeText(document.getElementById('out').innerText)
+    .then(()=>alert("UV信息已复制"));
+}
+function copyCode(){
+  if(!window.__javaCode){ alert("先生成Java代码"); return; }
+  navigator.clipboard.writeText(window.__javaCode)
+    .then(()=>alert("Java代码已复制"));
+}
+function setMode(m){ mode=m; }
+
+canvas.onmousedown = e=>{
+  const r=canvas.getBoundingClientRect();
+  const mx=e.clientX-r.left, my=e.clientY-r.top;
+  mouseDownStart={x:mx,y:my};
+
+  if(e.button===2){
+    for(let i=shapes.length-1;i>=0;i--){
+      const pts=shapes[i].points.map(p=>tex2screen(p.x,p.y));
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x,pts[0].y);
+      for(let k=1;k<pts.length;k++) ctx.lineTo(pts[k].x,pts[k].y);
+      ctx.closePath();
+      if(ctx.isPointInPath(mx,my)){ selectedShape=i; redraw(); return; }
+    }
+    selectedShape=-1; redraw();
+    return;
+  }
+
+  if(spaceDown){ dragView=true; dragViewStart={x:mx,y:my}; return; }
+
+  if(altDown){
+    for(const s of shapes){
+      for(let i=0;i<s.points.length;i++){
+        const sp=tex2screen(s.points[i].x,s.points[i].y);
+        if(Math.hypot(sp.x-mx,sp.y-my)<hitRange){
+          dragPointIdx={shape:shapes.indexOf(s), pt:i}; return;
+        }
+      }
+    }
+    for(let i=0;i<currentPath.length;i++){
+      const sp=tex2screen(currentPath[i].x,currentPath[i].y);
+      if(Math.hypot(sp.x-mx,sp.y-my)<hitRange){
+        dragPointIdx={path:true, pt:i}; return;
+      }
+    }
+  }
+};
+
+canvas.onmousemove = e=>{
+  const r=canvas.getBoundingClientRect();
+  const mx=e.clientX-r.left, my=e.clientY-r.top;
+  mouseTex=screen2tex(mx,my);
+
+  if(dragView){
+    viewX+=mx-dragViewStart.x; viewY+=my-dragViewStart.y;
+    dragViewStart={x:mx,y:my}; redraw(); return;
+  }
+  if(dragPointIdx!==null){
+    const t=screen2tex(mx,my);
+    if(dragPointIdx.path){
+      currentPath[dragPointIdx.pt]={x:t.x,y:t.y};
+    }else{
+      shapes[dragPointIdx.shape].points[dragPointIdx.pt]={x:t.x,y:t.y};
+      shapes[dragPointIdx.shape].bounds=calcBounds(shapes[dragPointIdx.shape].points);
+    }
+    redraw();
+  }else{
+    redraw();
+  }
+};
+
+canvas.onmouseup = e=>{
+  if(dragView){ dragView=false; return; }
+  if(dragPointIdx){ dragPointIdx=null; return; }
+  const r=canvas.getBoundingClientRect();
+  const mx=e.clientX-r.left, my=e.clientY-r.top;
+  const dx=mx-mouseDownStart.x, dy=my-mouseDownStart.y;
+  if(Math.sqrt(dx*dx+dy*dy)>dragThreshold) return;
+  const texPos=screen2tex(mx,my);
+
+  if(currentPath.length>=3){
+    const firstScreen=tex2screen(currentPath[0].x,currentPath[0].y);
+    if(Math.hypot(firstScreen.x-mx,firstScreen.y-my)<hitRange){
+      saveHistory();
+      const b=calcBounds(currentPath);
+      shapes.push({points:[...currentPath], bounds:b});
+      currentPath=[];
+      redraw(); return;
+    }
+  }
+  saveHistory();
+  currentPath.push({x:texPos.x,y:texPos.y});
+  redraw();
+};
+
+canvas.onwheel=e=>{
+  e.preventDefault();
+  const r=canvas.getBoundingClientRect();
+  const mx=e.clientX-r.left, my=e.clientY-r.top;
+  const before=screen2tex(mx,my);
+  if(e.deltaY<0) scale*=1.1; else scale/=1.1;
+  scale=Math.max(0.5, Math.min(scale, 20));
+  const after=tex2screen(before.x,before.y);
+  viewX+=mx-after.x; viewY+=my-after.y;
+  redraw();
+};
+
+document.addEventListener('keydown', e=>{
+  if(e.code==="Space"){ spaceDown=true; canvas.style.cursor="grab"; }
+  if(e.code==="AltLeft"||e.code==="AltRight"){ altDown=true; canvas.style.cursor="move"; }
+  if(e.code==="Delete"){
+    if(selectedShape>=0){ saveHistory(); shapes.splice(selectedShape,1); selectedShape=-1; redraw(); }
+  }
+  if(e.ctrlKey && e.code==="KeyZ"){
+    if(e.shiftKey) redo(); else undo();
+  }
+  if(e.code==="KeyF"){ mode=(mode==='solid')?'hollow':'solid'; }
+  if(e.code==="KeyG"){ genCode(); }
+  if(e.code==="KeyC" && !e.ctrlKey){ copyUV(); }
+});
+document.addEventListener('keyup', e=>{
+  if(e.code==="Space"){ spaceDown=false; canvas.style.cursor="crosshair"; }
+  if(e.code==="AltLeft"||e.code==="AltRight"){ altDown=false; canvas.style.cursor="crosshair"; }
+});
+
+document.getElementById('imgFile').onchange=e=>{
+  const f=e.target.files[0];
+  if(!f) return;
+  const reader=new FileReader();
+  reader.onload=ev=>{
+    const i=new Image();
+    i.onload=()=>{
+      img=i; imgW=i.width; imgH=i.height;
+      viewX=(wrap.clientWidth/2)-(imgW*scale/2);
+      viewY=(wrap.clientHeight/2)-(imgH*scale/2);
+      shapes=[]; currentPath=[]; historyStack=[]; redoStack=[]; selectedShape=-1;
+      renderHistoryList(); redraw();
+    };
+    i.src=ev.target.result;
+  };
+  reader.readAsDataURL(f);
+};
+
+window.addEventListener('resize',()=>{
+  canvas.width=wrap.clientWidth;
+  canvas.height=wrap.clientHeight;
+  redraw();
+});
+</script>
+</body>
+</html>
